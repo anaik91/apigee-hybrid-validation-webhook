@@ -1,2 +1,2 @@
 Flask
-google-cloud-logging
+gunicorn

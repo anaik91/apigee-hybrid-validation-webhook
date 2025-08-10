@@ -1,82 +1,104 @@
 import os
-from flask import Flask, request, jsonify
 import logging
-import google.cloud.logging # Imports the Cloud Logging client library
+import json
+import sys
+from datetime import datetime
 
-# === Setup Google Cloud's structured logging ===
-# Instantiates a client
-client = google.cloud.logging.Client()
+from flask import Flask, request, jsonify
 
-# Retrieves a Cloud Logging handler based on the environment
-# (this will appropriately format logs for Cloud Run)
-handler = client.get_default_handler()
+# --- Custom JSON Log Formatter (No changes needed) ---
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_record = {
+            "timestamp": datetime.utcfromtimestamp(record.created).isoformat() + "Z",
+            "severity": record.levelname,
+            "message": record.getMessage(),
+        }
+        if hasattr(record, "json_fields"):
+            log_record.update(record.json_fields)
+        return json.dumps(log_record)
 
-# The flask logger
-cloud_logger = logging.getLogger("cloudLogger")
-cloud_logger.setLevel(logging.INFO)
-cloud_logger.addHandler(handler)
-# === End of logging setup ===
+# --- Centralized Logging Setup (No changes needed) ---
+def setup_logging():
+    log_level_str = os.environ.get("LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, log_level_str, logging.INFO)
+    logger = logging.getLogger()
+    logger.setLevel(log_level)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    return logger
 
-app = Flask(__name__)
+logger = setup_logging()
 
-@app.route('/', methods=['POST'])
-def validate_pod():
-    try:
-        admission_review_req = request.json
-        uid = admission_review_req["request"]["uid"]
+# --- Application Factory ---
+def create_app():
+    """Creates and configures the Flask application."""
+    app = Flask(__name__)
 
-        # Log the entire incoming request as a structured JSON payload
-        cloud_logger.info(
-            f"Received AdmissionReview request for UID: {uid}", 
-            extra={"json_fields": admission_review_req}
+    @app.route('/healthz')
+    def healthz():
+        return jsonify({"status": "healthy"}), 200
+
+    @app.route('/validate', methods=['POST'])
+    def validate_pod():
+        # 1. Safely get the JSON body
+        try:
+            review_data = request.get_json()
+            if not review_data:
+                logger.warning("Received empty or invalid request body.")
+                return jsonify({"error": "Invalid request body"}), 400
+        except Exception as e:
+            logger.error(f"Could not parse request JSON: {e}", exc_info=True)
+            return jsonify({"error": "Invalid JSON received"}), 400
+
+        # 2. Manual, safe validation using .get() to prevent KeyErrors
+        request_info = review_data.get("request", {})
+        uid = request_info.get("uid")
+        pod = request_info.get("object", {})
+
+        # The UID is essential for a valid response. This is our critical check.
+        if not uid:
+            logger.error("Request is missing required 'request.uid' field.", extra={"json_fields": review_data})
+            return jsonify({"error": "Invalid AdmissionReview: missing uid"}), 400
+
+        logger.info(f"Received validation request for UID: {uid}")
+
+        # 3. The core validation logic (already safe due to .get())
+        pod_labels = pod.get("metadata", {}).get("labels", {})
+        allowed = False
+        message = "Pod rejected: Must include the label 'hello: world'."
+        
+        if pod_labels.get("hello") == "world":
+            allowed = True
+            message = "Pod allowed: Label 'hello: world' is present."
+
+        logger.info(
+            f"Validation decision for Pod '{pod.get('metadata', {}).get('name')}'",
+            extra={"json_fields": {"uid": uid, "allowed": allowed, "decision_message": message}}
         )
 
-    except Exception as e:
-        cloud_logger.error(f"Failed to parse request: {e}")
-        return jsonify({"error": f"Failed to parse request: {e}"}), 400
-
-    req = admission_review_req["request"]
-    pod = req.get("object", {})
-    pod_labels = pod.get("metadata", {}).get("labels", {})
-
-    allowed = False
-    message = "Pod rejected: Must include the label 'hello: world'."
-
-    if pod_labels.get("hello") == "world":
-        allowed = True
-        message = "Pod allowed: Label 'hello: world' is present."
-
-    # Log the result with key-value pairs that will become searchable fields
-    cloud_logger.info(
-        f"Validation result for {uid}", 
-        extra={
-            "json_fields": {
-                "uid": uid,
-                "allowed": allowed,
-                "message": message,
-                "pod_name": pod.get("metadata", {}).get("name")
-            }
+        # 4. Construct and send the response
+        admission_response = {
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "response": {"uid": uid, "allowed": allowed}
         }
-    )
+        if not allowed:
+            admission_response["response"]["status"] = {"code": 403, "message": message}
 
-    admission_review_resp = {
-        "apiVersion": "admission.k8s.io/v1",
-        "kind": "AdmissionReview",
-        "response": {
-            "uid": uid,
-            "allowed": allowed,
-        }
-    }
+        return jsonify(admission_response)
 
-    if not allowed:
-        admission_review_resp["response"]["status"] = {
-            "code": 403,
-            "message": message
-        }
+    @app.errorhandler(Exception)
+    def handle_unexpected_error(e):
+        logger.critical(f"An unhandled exception occurred: {e}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred."}), 500
+        
+    return app
 
-    return jsonify(admission_review_resp), 200
+app = create_app()
 
-# This part is only for local testing and won't be used in Cloud Run
+# This local run block is unchanged and won't be used by Gunicorn.
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)), debug=True)

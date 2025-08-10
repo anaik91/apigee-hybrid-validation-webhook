@@ -1,7 +1,5 @@
 #!/bin/bash
 
-#!/bin/bash
-
 # --- CONFIGURATION ---
 export PROJECT_ID="apigee-hybrid-378710"
 export REGION="us-central1"
@@ -50,8 +48,8 @@ webhooks:
         pod-validation: enabled
     clientConfig:
       # This section tells the API server how to connect to your service
-      url: "$WEBHOOK_URL"
-      caBundle: "$CA_BUNDLE"
+      url: $WEBHOOK_URL/validate
+      caBundle: $CA_BUNDLE
     rules:
       # This section defines which requests to intercept
       - operations: ["CREATE"]

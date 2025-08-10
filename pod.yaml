@@ -3,7 +3,7 @@ kind: Pod
 metadata:
   name: pod-without-label
   labels:
-    hello: world1
+    hello: world
 spec:
   containers:
     - name: nginx
