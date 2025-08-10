@@ -2,15 +2,18 @@ import os
 import logging
 import json
 import sys
-from datetime import datetime
+# --- IMPORTANT: Import timezone from datetime ---
+from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify
 
-# --- Custom JSON Log Formatter (No changes needed) ---
+# --- Custom JSON Log Formatter (Corrected) ---
 class JsonFormatter(logging.Formatter):
     def format(self, record):
+        # Create a timezone-aware datetime object directly. This is the modern, correct way.
+        timestamp = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
         log_record = {
-            "timestamp": datetime.utcfromtimestamp(record.created).isoformat() + "Z",
+            "timestamp": timestamp,
             "severity": record.levelname,
             "message": record.getMessage(),
         }
@@ -43,7 +46,6 @@ def create_app():
 
     @app.route('/validate', methods=['POST'])
     def validate_pod():
-        # 1. Safely get the JSON body
         try:
             review_data = request.get_json()
             if not review_data:
@@ -53,19 +55,16 @@ def create_app():
             logger.error(f"Could not parse request JSON: {e}", exc_info=True)
             return jsonify({"error": "Invalid JSON received"}), 400
 
-        # 2. Manual, safe validation using .get() to prevent KeyErrors
         request_info = review_data.get("request", {})
         uid = request_info.get("uid")
         pod = request_info.get("object", {})
 
-        # The UID is essential for a valid response. This is our critical check.
         if not uid:
             logger.error("Request is missing required 'request.uid' field.", extra={"json_fields": review_data})
             return jsonify({"error": "Invalid AdmissionReview: missing uid"}), 400
 
         logger.info(f"Received validation request for UID: {uid}")
 
-        # 3. The core validation logic (already safe due to .get())
         pod_labels = pod.get("metadata", {}).get("labels", {})
         allowed = False
         message = "Pod rejected: Must include the label 'hello: world'."
@@ -79,7 +78,6 @@ def create_app():
             extra={"json_fields": {"uid": uid, "allowed": allowed, "decision_message": message}}
         )
 
-        # 4. Construct and send the response
         admission_response = {
             "apiVersion": "admission.k8s.io/v1",
             "kind": "AdmissionReview",
@@ -99,6 +97,5 @@ def create_app():
 
 app = create_app()
 
-# This local run block is unchanged and won't be used by Gunicorn.
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)), debug=True)
