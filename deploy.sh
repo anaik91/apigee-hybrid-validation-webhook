@@ -1,33 +1,27 @@
 #!/bin/bash
 
-# --- CONFIGURATION ---
-export PROJECT_ID="apigee-hybrid-378710"
-export REGION="us-central1"
+SCRIPTPATH="$(
+    cd "$(dirname "$0")" || exit >/dev/null 2>&1
+    pwd -P
+)"
 
-# The "folder" for our images
-export REPOSITORY_NAME="k8s-webhooks" 
-
-# The name of this specific image
-export IMAGE_NAME="hello-world-validator"
-
-# The name for our Cloud Run service
-export SERVICE_NAME="k8s-admission-webhook"
-# --- END CONFIGURATION ---
-
-# Set the project for the gcloud CLI
-gcloud config set project ${PROJECT_ID}
+# shellcheck disable=SC1091
+source "$SCRIPTPATH/env.sh"
 
 gcloud builds submit . \
   --tag "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY_NAME}/${IMAGE_NAME}:latest"
 
 # Deploy the container to Cloud Run
-gcloud run deploy ${SERVICE_NAME} \
+gcloud run deploy "${SERVICE_NAME}" \
     --image "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY_NAME}/${IMAGE_NAME}:latest" \
-    --region=${REGION} \
+    --region="${REGION}" \
     --platform managed \
     --allow-unauthenticated
 
-WEBHOOK_URL=$(gcloud run services describe ${SERVICE_NAME} --platform managed --region ${REGION} --format 'value(status.url)')
+WEBHOOK_URL=$(gcloud run services describe \
+  "${SERVICE_NAME}" --platform managed \
+  --region "${REGION}" --format 'value(status.url)')
+
 export WEBHOOK_URL 
 echo "Webhook URL: ${WEBHOOK_URL}"
 
@@ -39,31 +33,49 @@ cat > web_hook.yaml << EOF
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
-  # The name of this configuration object
-  name: demo-cloudrun-validation-webhook
+  # A more descriptive name for the webhook's purpose
+  name: $WEBHOOK_NAME
 webhooks:
-  - name: helloworld.example.com # A unique name for your webhook
+  - name: apigee-auditor.example.com
+    # Optional: If you want this to apply cluster-wide, remove the namespaceSelector.
+    # If you only want it for specific Apigee namespaces, keep it.
     namespaceSelector:
       matchLabels:
-        pod-validation: enabled
+        apigee-runtime: "true" # Example label: you must label your Apigee namespace
     clientConfig:
-      # This section tells the API server how to connect to your service
       url: $WEBHOOK_URL/validate
       caBundle: $CA_BUNDLE
+    
+    # --- THIS IS THE KEY CHANGE ---
+    # These rules tell the API server which resources to send to the webhook.
     rules:
-      # This section defines which requests to intercept
-      - operations: ["CREATE"]
-        apiGroups: [""]
-        apiVersions: ["v1"]
-        resources: ["pods"]
-    # If the webhook fails to respond, the request will be rejected.
-    failurePolicy: Fail
-    # This webhook only intercepts requests; it doesn't modify them.
+      - operations: ["CREATE", "UPDATE"]
+        apiGroups: ["apigee.cloud.google.com"]
+        apiVersions: ["v1alpha1", "v1alpha2", "v1alpha3"]
+        resources:
+          # v1alpha1 resources
+          - apigeeredis
+          - apigeedatastores
+          - apigeeissues
+          - apigeerouteconfigs
+          - cassandradatareplications
+          - secretrotations
+          # v1alpha2 resources
+          - apigeeorganizations
+          - apigeeenvironments
+          - apigeeroutes
+          - apigeetelemetries
+          # v1alpha3 resources
+          # - apigeedeployments
+    # --- END OF KEY CHANGE ---
+
+    # It's critical to set failurePolicy to Ignore for a non-blocking audit webhook.
+    # This ensures that if your webhook service goes down, it doesn't block Apigee changes.
+    failurePolicy: Ignore
     sideEffects: None
-    # The API version for the AdmissionReview object sent to your webhook.
     admissionReviewVersions: ["v1"]
 EOF
 
 kubectl apply -f web_hook.yaml
 
-kubectl get validatingwebhookconfiguration demo-cloudrun-validation-webhook
+kubectl get validatingwebhookconfiguration "$WEBHOOK_NAME"

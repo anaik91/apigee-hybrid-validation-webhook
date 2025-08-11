@@ -2,15 +2,13 @@ import os
 import logging
 import json
 import sys
-# --- IMPORTANT: Import timezone from datetime ---
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify
 
-# --- Custom JSON Log Formatter (Corrected) ---
+# --- Custom JSON Log Formatter (No changes needed) ---
 class JsonFormatter(logging.Formatter):
     def format(self, record):
-        # Create a timezone-aware datetime object directly. This is the modern, correct way.
         timestamp = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
         log_record = {
             "timestamp": timestamp,
@@ -45,7 +43,7 @@ def create_app():
         return jsonify({"status": "healthy"}), 200
 
     @app.route('/validate', methods=['POST'])
-    def validate_pod():
+    def validate_apigee_change():
         try:
             review_data = request.get_json()
             if not review_data:
@@ -55,43 +53,71 @@ def create_app():
             logger.error(f"Could not parse request JSON: {e}", exc_info=True)
             return jsonify({"error": "Invalid JSON received"}), 400
 
-        request_info = review_data.get("request", {})
-        uid = request_info.get("uid")
-        pod = request_info.get("object", {})
+        # --- CORE AUDITING LOGIC ---
+        try:
+            request_info = review_data.get("request", {})
+            uid = request_info.get("uid")
 
-        if not uid:
-            logger.error("Request is missing required 'request.uid' field.", extra={"json_fields": review_data})
-            return jsonify({"error": "Invalid AdmissionReview: missing uid"}), 400
+            if not uid:
+                logger.error("Request is missing 'request.uid' field.", extra={"json_fields": review_data})
+                return jsonify({"error": "Invalid AdmissionReview: missing uid"}), 400
 
-        logger.info(f"Received validation request for UID: {uid}")
+            # Extract details for the audit log
+            resource = request_info.get("resource", {})
+            user_info = request_info.get("userInfo", {})
+            obj = request_info.get("object", {})
+            metadata = obj.get("metadata", {})
+            
+            # Create a structured log entry with all relevant details
+            audit_details = {
+                "uid": uid,
+                "user": user_info.get("username"),
+                "groups": user_info.get("groups"),
+                "operation": request_info.get("operation"),
+                "resource": {
+                    "group": resource.get("group"),
+                    "version": resource.get("version"),
+                    "kind": request_info.get("kind", {}).get("kind"),
+                    "name": metadata.get("name"),
+                    "namespace": metadata.get("namespace"),
+                    "spec": resource.get("spec")
+                }
+            }
 
-        pod_labels = pod.get("metadata", {}).get("labels", {})
-        allowed = False
-        message = "Pod rejected: Must include the label 'hello: world'."
-        
-        if pod_labels.get("hello") == "world":
-            allowed = True
-            message = "Pod allowed: Label 'hello: world' is present."
+            # The main log message for easy searching
+            logger.info(
+                f"Apigee resource change detected: {audit_details['operation']} on {audit_details['resource']['kind']} '{audit_details['resource']['name']}' by '{audit_details['user']}'",
+                extra={"json_fields": {"audit_event": audit_details}}
+            )
 
-        logger.info(
-            f"Validation decision for Pod '{pod.get('metadata', {}).get('name')}'",
-            extra={"json_fields": {"uid": uid, "allowed": allowed, "decision_message": message}}
-        )
-
+        except Exception as e:
+            # If logging fails, we still allow the request but log the internal error
+            logger.critical(f"Failed to process audit event, but allowing request. Error: {e}", exc_info=True)
+            # Ensure we can still get the UID if possible
+            uid = review_data.get("request", {}).get("uid", "unknown-uid")
+            
+        # --- ALWAYS ALLOW THE REQUEST ---
+        # This makes the webhook a non-blocking auditor.
         admission_response = {
             "apiVersion": "admission.k8s.io/v1",
             "kind": "AdmissionReview",
-            "response": {"uid": uid, "allowed": allowed}
+            "response": {"uid": uid, "allowed": True}
         }
-        if not allowed:
-            admission_response["response"]["status"] = {"code": 403, "message": message}
-
         return jsonify(admission_response)
 
     @app.errorhandler(Exception)
     def handle_unexpected_error(e):
         logger.critical(f"An unhandled exception occurred: {e}", exc_info=True)
-        return jsonify({"error": "An internal server error occurred."}), 500
+        # In a pure audit webhook, it might be safer to allow on failure
+        # rather than blocking a legitimate change.
+        try:
+            uid = request.get_json().get("request", {}).get("uid", "unknown-uid-on-crash")
+            response = {"uid": uid, "allowed": True, "status": {"message": "Webhook failed but allowed request."}}
+            return jsonify({"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview", "response": response})
+        except:
+             # If we can't even parse the request to get a UID, we can't form a valid response.
+             # This will cause the API server request to fail, which is a safe default.
+             return jsonify({"error": "A critical internal server error occurred."}), 500
         
     return app
 

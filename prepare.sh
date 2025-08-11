@@ -1,25 +1,14 @@
 #!/bin/bash
 
-#!/bin/bash
+SCRIPTPATH="$(
+    cd "$(dirname "$0")" || exit >/dev/null 2>&1
+    pwd -P
+)"
 
-# --- CONFIGURATION ---
-export PROJECT_ID="apigee-hybrid-378710"
-export REGION="us-central1"
+# shellcheck disable=SC1091
+source "$SCRIPTPATH/env.sh"
 
-# The "folder" for our images
-export REPOSITORY_NAME="k8s-webhooks" 
-
-# The name of this specific image
-export IMAGE_NAME="hello-world-validator"
-
-# The name for our Cloud Run service
-export SERVICE_NAME="k8s-admission-webhook"
-# --- END CONFIGURATION ---
-
-# Set the project for the gcloud CLI
-gcloud config set project ${PROJECT_ID}
-
-gcloud artifacts repositories create ${REPOSITORY_NAME} \
+gcloud artifacts repositories create "${REPOSITORY_NAME}" \
     --repository-format=docker \
-    --location=${REGION} \
+    --location="${REGION}" \
     --description="Repository for Kubernetes webhook images"
