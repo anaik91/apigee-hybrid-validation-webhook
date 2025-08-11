@@ -1,172 +1,129 @@
-# Kubernetes Validating Webhook on Google Cloud Run
+# Kubernetes Auditing Webhook for Apigee Hybrid
+This project is a production-grade, non-blocking auditing webhook for an Apigee Hybrid runtime. It is implemented in Python using Flask/Gunicorn and deployed as a serverless function on Google Cloud Run.
+The primary goal of this webhook is to create an immutable, real-time audit trail of all configuration changes made to critical Apigee Hybrid Custom Resources (CRDs) within a Kubernetes cluster.
 
-This project is a "Hello World" example of a Kubernetes [Validating Admission Webhook](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/) implemented in Python with Flask and deployed as a serverless function on **Google Cloud Run**.
+## Core Functionality
+This is an auditing webhook, not a validating one. Its key behaviors are:
+Always Allows: It intercepts requests but never blocks them. It will always respond with "allowed": true".
+Structured Logging: It captures the entire AdmissionReview payload for every intercepted request and logs it as a structured JSON object to Google Cloud Logging. This provides a complete, searchable record of who changed what, and when.
+Non-Blocking on Failure: The webhook is configured with failurePolicy: Ignore. This is critical for production, as it ensures that if the webhook service is unavailable, it will not prevent legitimate changes to the Apigee runtime.
+Scoped by Namespace: It uses a namespaceSelector to target only the namespaces where your Apigee Hybrid runtime components are deployed.
 
-## What It Does
+## Auditing Flow
+* A user or process runs kubectl apply or kubectl edit on an Apigee CRD (e.g., ApigeeEnvironment).
+* The Kubernetes API Server intercepts the CREATE or UPDATE request.
+* The API Server checks its ValidatingWebhookConfiguration and sees a rule matching the Apigee resource.
+* The API Server sends a detailed AdmissionReview request to the public URL of our Cloud Run service.
+* The Flask app on Cloud Run receives the request.
+* The app logs the entire request payload as a structured JSON log to Google Cloud Logging.
+* The app immediately responds to the API Server with {"response": {"allowed": true}}.
+* The API Server completes the user's original request, persisting the change.
 
-The webhook intercepts `CREATE` requests for Pods in any namespace that has the label `pod-validation=enabled`.
-
-It will **REJECT** any Pod that does not have the label `hello: world`.
-
-### Architecture
-
-1.  A user runs `kubectl apply -f pod.yaml`.
-2.  The Kubernetes API Server checks its `ValidatingWebhookConfiguration`.
-3.  If the request matches the rules (a Pod creation in a labeled namespace), the API server sends an `AdmissionReview` request to the public URL of our Cloud Run service.
-4.  The Python Flask app on Cloud Run inspects the request.
-5.  It sends back an `AdmissionReview` response indicating `allowed: true` or `allowed: false`.
-6.  The Kubernetes API Server enforces the decision.
 
 ## Prerequisites
-
-*   `gcloud` CLI installed and authenticated.
-*   `kubectl` CLI installed and configured to point to a Kubernetes cluster.
-*   A Google Cloud project with billing enabled.
-*   The following Google Cloud APIs enabled in your project:
-    *   Cloud Build API (`cloudbuild.googleapis.com`)
-    *   Artifact Registry API (`artifactregistry.googleapis.com`)
-    *   Cloud Run API (`run.googleapis.com`)
+* gcloud CLI installed and authenticated.
+* kubectl CLI installed and configured to point to a Kubernetes cluster where Apigee Hybrid is running.
+* A Google Cloud project with billing enabled.
+* The following Google Cloud APIs enabled in your project:
+    * Cloud Build API (cloudbuild.googleapis.com)
+    * Artifact Registry API (artifactregistry.googleapis.com)
+    * Cloud Run API (run.googleapis.com)
 
 ## Deployment Steps
 
-#### 1. Clone the Repository
+1. Clone the Repository
 
-```bash
-git clone <your-repo-url>
-cd <your-repo-directory>
-```
+    ```bash
+    git clone <your-repo-url>
+    cd <your-repo-directory>
+    ```
 
-#### 2. Configure Environment Variables
+2. Configure Environment Variables
+    Set the following environment variables in your terminal. These will be used in subsequent commands.
 
-Set the following environment variables in your terminal. These will be used in subsequent commands.
+    ```bash
+    # --- CONFIGURE THESE VALUES ---
+    export PROJECT_ID="your-gcp-project-id"
+    export REGION="us-central1" # e.g., us-central1
+    # --- END CONFIGURATION ---
 
-```bash
-# --- CONFIGURE THESE VALUES ---
-export PROJECT_ID="your-gcp-project-id"
-export REGION="us-central1" # e.g., us-central1
-# --- END CONFIGURATION ---
+    # The name for the Artifact Registry "folder"
+    export REPOSITORY_NAME="k8s-webhooks"
 
-# The name for the Artifact Registry "folder"
-export REPOSITORY_NAME="k8s-webhooks"
+    # The name for this specific container image
+    export IMAGE_NAME="apigee-auditor"
 
-# The name for this specific container image
-export IMAGE_NAME="hello-world-validator"
+    # The name for our Cloud Run service
+    export SERVICE_NAME="apigee-auditor-webhook"
 
-# The name for our Cloud Run service
-export SERVICE_NAME="k8s-admission-webhook"
+    # Set gcloud to use your project
+    gcloud config set project ${PROJECT_ID}
+    ```
 
-# Set gcloud to use your project
-gcloud config set project ${PROJECT_ID}
-```
+3. Build and Deploy to Cloud Run
 
-#### 3. Create the Artifact Registry Repository
+    ```bash
+    bash prepare.sh
+    bash deploy.sh
+    ```
 
-This is a one-time setup step to create a "folder" to store your container images.
+4. Configure Kubernetes
 
-```bash
-gcloud artifacts repositories create ${REPOSITORY_NAME} \
-    --repository-format=docker \
-    --location=${REGION} \
-    --description="Repository for Kubernetes webhook images"
-```
-
-#### 4. Build and Deploy to Cloud Run
-
-This single command builds your container image using Cloud Build and deploys it to Cloud Run.
-
-```bash
-# Build and push the image
-gcloud builds submit . --tag "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY_NAME}/${IMAGE_NAME}:latest"
-
-# Deploy the service
-gcloud run deploy ${SERVICE_NAME} \
-    --image "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY_NAME}/${IMAGE_NAME}:latest" \
-    --region=${REGION} \
-    --allow-unauthenticated
-```
-
-#### 5. Configure Kubernetes
-
-Now we will tell Kubernetes about our new webhook.
-
-**A. Label the target namespace:**
-
-The webhook will only apply to namespaces with this label.
-```bash
-# Create a namespace to test in
-kubectl create namespace production-apps
-
-# Add the required label
-kubectl label namespace production-apps pod-validation=enabled
-```
-
-**B. Get the required values for the webhook configuration:**
-
-```bash
-# Get the Cloud Run URL
-export WEBHOOK_URL=$(gcloud run services describe ${SERVICE_NAME} --platform managed --region ${REGION} --format 'value(status.url)')
-
-# Download Google's root CA certificates
-curl -s https://pki.goog/roots.pem > roots.pem
-
-# Base64-encode the CA bundle
-export CA_BUNDLE=$(cat roots.pem | base64 -w 0) # Use `base64 -b 0` on macOS
-```
-
-**C. Apply the ValidatingWebhookConfiguration:**
-
-This command substitutes the placeholders in the template YAML and applies it to your cluster.
-```bash
-# Create a temporary copy
-cp webhook-config.yaml webhook-config-final.yaml
-
-# Replace placeholders
-sed -i.bak "s|WEBHOOK_URL_PLACEHOLDER|${WEBHOOK_URL}|g" webhook-config-final.yaml
-sed -i.bak "s|CA_BUNDLE_PLACEHOLDER|${CA_BUNDLE}|g" webhook-config-final.yaml
-
-# Apply the final configuration
-kubectl apply -f webhook-config-final.yaml
-```
+    ```bash
+    kubectl label namespace apigee apigee-runtime="true"
+    ```
 
 ## Testing the Webhook
 
-#### Test 1: Rejected Pod
+To test the auditor, you need to make a change to a real Apigee resource and then verify that the change was logged.
 
-Try to create a Pod without the required label in the `production-apps` namespace. This should **fail**.
+1. Edit an Apigee Resource: Use kubectl edit to make a small, harmless change, like adding an annotation to an ApigeeEnvironment. Replace <your-env-name> and <your-apigee-ns> accordingly.
 
-```bash
-kubectl apply -f pod-fail.yaml -n production-apps
-```
-**Expected Output:**
-```
-Error from server: error when creating "pod-fail.yaml": admission webhook "helloworld.example.com" denied the request: Pod rejected: Must include the label 'hello: world'.
-```
+    ```bash
+    kubectl edit apigeeenvironment <your-env-name> -n <your-apigee-ns>
+    ```
 
-#### Test 2: Allowed Pod
+2. Check the Cloud Run Logs: Immediately check the logs for your service. This is where you will see the audit trail.
 
-Try to create a Pod *with* the required label. This should **succeed**.
-```bash
-kubectl apply -f pod-success.yaml -n production-apps
-```
-**Expected Output:**
-```
-pod/pod-with-label created
-```
+    ```bash
+    gcloud run services logs tail ${SERVICE_NAME} --region=${REGION}
+    ```
 
-## Logging and Debugging
+## Logging and Auditing
 
-To see the logs from your Python application, check the Cloud Run logs:
-```bash
-gcloud run services logs tail ${SERVICE_NAME} --region=${REGION}
+The power of this webhook comes from its structured logs. In the Google Cloud Log Explorer, you will see entries that look like this:
+
+
+```
+{
+  "timestamp": "2023-10-28T10:20:30.123Z",
+  "severity": "INFO",
+  "message": "Audit: UPDATE on ApigeeEnvironment 'my-test-env' by user 'user@example.com'",
+  "admission_request": {
+    "uid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+    "kind": { "group": "apigee.cloud.google.com", "version": "v1alpha2", "kind": "ApigeeEnvironment" },
+    "operation": "UPDATE",
+    "userInfo": { "username": "user@example.com", "groups": ["system:authenticated"] },
+    "object": {
+      "apiVersion": "apigee.cloud.google.com/v1alpha2",
+      "kind": "ApigeeEnvironment",
+      "metadata": { "name": "my-test-env", ... },
+      "spec": { "displayName": "My Test Env", ... }
+    },
+    "oldObject": {
+       "spec": { "displayName": "My Old Display Name", ... }
+    }
+  }
+}
 ```
 
 ## Cleanup
-
 To remove all the resources created in this demo, run the following commands:
+
 ```bash
+
 # Delete Kubernetes resources
-kubectl delete validatingwebhookconfiguration demo-cloudrun-validation-webhook
-kubectl delete namespace production-apps
+kubectl delete validatingwebhookconfiguration apigee-change-auditor-webhook
 
 # Delete Google Cloud resources
 gcloud run services delete ${SERVICE_NAME} --region=${REGION}
